@@ -55,6 +55,21 @@ public final class ColumnVector extends ColumnView {
   private Optional<Long> nullCount = Optional.empty();
   private int refCount;
   private EventHandler eventHandler;
+  private volatile long deviceMemorySize = -1;
+
+  @Override
+  public long getDeviceMemorySize() {
+    if (getNativeView() == 0) {
+      // Preserve the native use-after-close check even after the size was cached.
+      return super.getDeviceMemorySize();
+    }
+    long size = deviceMemorySize;
+    if (size < 0) {
+      size = super.getDeviceMemorySize();
+      deviceMemorySize = size;
+    }
+    return size;
+  }
 
   /**
    * Wrap an existing on device cudf::column with the corresponding ColumnVector. The new

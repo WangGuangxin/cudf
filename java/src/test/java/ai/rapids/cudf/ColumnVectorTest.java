@@ -7079,6 +7079,7 @@ void testGetJSONObjectWithInvalidQueries() {
   @Test
   public void testUseAfterFree() {
     ColumnVector vector = ColumnVector.fromBoxedInts(1, 2, 3);
+    assertEquals(12, vector.getDeviceMemorySize());
     vector.close();
     assertThrows(NullPointerException.class, vector::getDeviceMemorySize);
   }

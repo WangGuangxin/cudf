@@ -23,6 +23,8 @@
 #include <cooperative_groups.h>
 #include <cuda/std/cstddef>
 
+#include <array>
+
 namespace cudf::groupby::detail::hash {
 namespace {
 /// Shared memory data alignment
@@ -263,6 +265,33 @@ CUDF_KERNEL void single_pass_shmem_aggs_kernel(cudf::size_type num_rows,
                                d_agg_kinds);
   }
 }
+// This translation unit's private kernel never changes its function attributes. Its occupancy
+// depends on the device, cache/shared-memory preference, and requested resident blocks, rather
+// than the input columns or stream. Keep the bounded memoization local to each calling thread
+// so concurrent groupbys do not contend on another host lock.
+struct shared_memory_occupancy_cache {
+  int device{-1};
+  cudaFuncCache cache_config{cudaFuncCachePreferNone};
+  std::array<size_type, 32> dynamic_sizes;
+  int32_t max_blocks{-1};
+
+  shared_memory_occupancy_cache() { dynamic_sizes.fill(-1); }
+};
+
+shared_memory_occupancy_cache& current_occupancy_cache()
+{
+  thread_local shared_memory_occupancy_cache cache;
+  int device;
+  cudaFuncCache cache_config;
+  CUDF_CUDA_TRY(cudaGetDevice(&device));
+  CUDF_CUDA_TRY(cudaDeviceGetCacheConfig(&cache_config));
+  if (cache.device != device || cache.cache_config != cache_config) {
+    cache              = shared_memory_occupancy_cache{};
+    cache.device       = device;
+    cache.cache_config = cache_config;
+  }
+  return cache;
+}
 }  // namespace
 
 size_type get_available_shared_memory_size(cudf::size_type grid_size)
@@ -270,18 +299,31 @@ size_type get_available_shared_memory_size(cudf::size_type grid_size)
   auto const active_blocks_per_sm =
     cudf::util::div_rounding_up_safe(grid_size, cudf::detail::num_multiprocessors());
 
-  size_t dynamic_shmem_size = 0;
-  CUDF_CUDA_TRY(cudaOccupancyAvailableDynamicSMemPerBlock(
-    &dynamic_shmem_size, single_pass_shmem_aggs_kernel, active_blocks_per_sm, GROUPBY_BLOCK_SIZE));
-  return cudf::util::round_down_safe(static_cast<cudf::size_type>(0.5 * dynamic_shmem_size),
-                                     ALIGNMENT);
+  auto const calculate = [&] {
+    size_t dynamic_shmem_size = 0;
+    CUDF_CUDA_TRY(cudaOccupancyAvailableDynamicSMemPerBlock(
+      &dynamic_shmem_size, single_pass_shmem_aggs_kernel, active_blocks_per_sm, GROUPBY_BLOCK_SIZE));
+    return cudf::util::round_down_safe(static_cast<cudf::size_type>(0.5 * dynamic_shmem_size),
+                                       ALIGNMENT);
+  };
+  auto& cache = current_occupancy_cache();
+  // The capacity is only a cache bound, not an assumption about future devices' occupancy.
+  if (active_blocks_per_sm <= 0 || static_cast<size_t>(active_blocks_per_sm) > cache.dynamic_sizes.size()) {
+    return calculate();
+  }
+  auto& size = cache.dynamic_sizes[active_blocks_per_sm - 1];
+  if (size < 0) { size = calculate(); }
+  return size;
 }
 
 int32_t max_active_blocks_shmem_aggs_kernel()
 {
+  auto& cache = current_occupancy_cache();
+  if (cache.max_blocks >= 0) { return cache.max_blocks; }
   int32_t max_active_blocks{-1};
   CUDF_CUDA_TRY(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
     &max_active_blocks, single_pass_shmem_aggs_kernel, GROUPBY_BLOCK_SIZE, 0));
+  cache.max_blocks = max_active_blocks;
   return max_active_blocks;
 }
 

@@ -4742,6 +4742,34 @@ public class TableTest extends CudfTestBase {
   }
 
   @Test
+  void testPackedColumnsRetainAllocationAfterOwnersClose() {
+    try (Table expected = new Table.TestBuilder()
+        .column("alpha", "", null, "\u4e2d\u6587")
+        .column(new String[]{null, null, null, null})
+        .decimal64Column(-3, 7L, null, -11L, 0L)
+        .build();
+         CloseableArray<ColumnVector> retained = CloseableArray.wrap(
+             new ColumnVector[expected.getNumberOfColumns()])) {
+      try (ContiguousTable packed = expected.contiguousSplit()[0];
+           Table unpacked = Table.fromPackedTable(
+               packed.getMetadataDirectBuffer(), packed.getBuffer())) {
+        for (int i = 0; i < retained.size(); i++) {
+          retained.set(i, unpacked.getColumn(i).incRefCount());
+        }
+      }
+      // Only the retained columns now keep the contiguous device allocation alive.
+      try (Table actual = new Table(retained.getArray())) {
+        assertTablesAreEqual(expected, actual);
+        for (int i = 0; i < actual.getNumberOfColumns(); i++) {
+          long size = expected.getColumn(i).getDeviceMemorySize();
+          assertEquals(size, actual.getColumn(i).getDeviceMemorySize());
+          assertEquals(size, actual.getColumn(i).getDeviceMemorySize());
+        }
+      }
+    }
+  }
+
+  @Test
   void testSerializationReconstructFromMetadata() throws IOException {
     try (Table t = buildTestTable()) {
       ByteArrayOutputStream bout = new ByteArrayOutputStream();

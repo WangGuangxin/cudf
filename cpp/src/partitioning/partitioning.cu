@@ -26,10 +26,15 @@
 
 #include <cub/block/block_scan.cuh>
 #include <cub/device/device_histogram.cuh>
+#include <cub/device/device_radix_sort.cuh>
 #include <cuda/atomic>
 #include <cuda/devices>
 #include <cuda/iterator>
+#include <cuda/std/bit>
+#include <thrust/for_each.h>
 #include <thrust/scan.h>
+#include <thrust/sequence.h>
+#include <thrust/scatter.h>
 #include <thrust/transform.h>
 
 #include <stdexcept>
@@ -541,20 +546,27 @@ std::pair<std::unique_ptr<table>, std::vector<size_type>> hash_partition_table_g
   // Copy partition offsets to pinned host memory asynchronously
   auto const pinned_offsets = cudf::detail::make_pinned_vector_async(histogram, stream);
 
-  // Build scatter map: atomically increment partition offsets
-  rmm::device_uvector<size_type> scatter_map(num_rows, stream);
-  thrust::transform(
+  // Build gather map: atomically increment partition offsets to place each row, and record
+  // the inverse so the output is gathered instead of scattered into a full copy of `input`
+  rmm::device_uvector<size_type> gather_map(num_rows, stream);
+  thrust::for_each_n(
     rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-    row_partition_numbers.begin(),
-    row_partition_numbers.end(),
-    scatter_map.begin(),
-    [offsets = histogram.data()] __device__(auto partition_number) {
-      cuda::atomic_ref<size_type, cuda::thread_scope_device> ref(offsets[partition_number]);
-      return ref.fetch_add(1, cuda::memory_order_relaxed);
+    cuda::counting_iterator<size_type>{0},
+    num_rows,
+    [partitions = row_partition_numbers.data(),
+     offsets    = histogram.data(),
+     gather     = gather_map.data()] __device__(size_type row) {
+      cuda::atomic_ref<size_type, cuda::thread_scope_device> ref(offsets[partitions[row]]);
+      gather[ref.fetch_add(1, cuda::memory_order_relaxed)] = row;
     });
 
-  // Scatter input rows into partitioned output
-  auto output = detail::scatter(input, scatter_map, input, stream, mr);
+  // Gather input rows into partitioned output
+  auto output = detail::gather(input,
+                               gather_map,
+                               out_of_bounds_policy::DONT_CHECK,
+                               negative_index_policy::NOT_ALLOWED,
+                               stream,
+                               mr);
 
   stream.synchronize();  // Pinned async D2H copy must finish before returning host vec
 
@@ -739,8 +751,19 @@ std::pair<std::unique_ptr<table>, std::vector<size_type>> hash_partition_table(
       row_output_locations, num_rows, num_partitions, scanned_block_partition_sizes_ptr);
     CUDF_CUDA_TRY(cudaGetLastError());
 
-    // Use the resulting scatter map to materialize the output
-    auto output = detail::scatter(input, row_partition_numbers, input, stream, mr);
+    // Invert the scatter map and gather, rather than scattering into a full copy of `input`
+    rmm::device_uvector<size_type> gather_map(num_rows, stream);
+    thrust::scatter(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                    cuda::counting_iterator<size_type>{0},
+                    cuda::counting_iterator<size_type>{num_rows},
+                    row_partition_numbers.begin(),
+                    gather_map.begin());
+    auto output = detail::gather(input,
+                                 gather_map,
+                                 out_of_bounds_policy::DONT_CHECK,
+                                 negative_index_policy::NOT_ALLOWED,
+                                 stream,
+                                 mr);
 
     stream.synchronize();  // Async D2H copy must finish before returning host vec
     return std::pair{std::move(output), std::move(partition_offsets)};
@@ -811,27 +834,56 @@ struct dispatch_map_type {
                            histogram.end(),
                            histogram.begin());
 
-    // Copy offsets to host before the transform below modifies the histogram
+    // Copy partition offsets to host
     auto const partition_offsets = cudf::detail::make_std_vector(histogram, stream);
 
-    // Unfortunately need to materialize the scatter map because
-    // `detail::scatter` requires multiple passes through the iterator
-    rmm::device_uvector<size_type> scatter_map(partition_map.size(), stream);
+    // Order row indices by partition number with a radix sort on just the bits that can be set
+    // in a partition number. This replaces per-row atomic increments of the partition offsets,
+    // which serialize heavily when many rows share few partitions, and yields a stable order.
+    // The sorted row indices form a gather map, which avoids `detail::scatter(t, map, t)` first
+    // copying all of `t` into the output only for every row to be overwritten.
+    auto const num_rows = partition_map.size();
+    rmm::device_uvector<size_type> row_indices(num_rows, stream);
+    thrust::sequence(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                     row_indices.begin(),
+                     row_indices.end());
+    rmm::device_uvector<MapType> sorted_partitions(num_rows, stream);
+    rmm::device_uvector<size_type> gather_map(num_rows, stream);
+    // Partition numbers are in [0, num_partitions), so only the low bits need sorting
+    int const end_bit =
+      std::max(1, static_cast<int>(cuda::std::bit_width(static_cast<uint32_t>(num_partitions))));
+    std::size_t sort_temp_bytes{};
+    cub::DeviceRadixSort::SortPairs(nullptr,
+                                    sort_temp_bytes,
+                                    partition_map.begin<MapType>(),
+                                    sorted_partitions.data(),
+                                    row_indices.data(),
+                                    gather_map.data(),
+                                    num_rows,
+                                    0,
+                                    end_bit,
+                                    stream.value());
+    rmm::device_buffer sort_temp(sort_temp_bytes, stream);
+    cub::DeviceRadixSort::SortPairs(sort_temp.data(),
+                                    sort_temp_bytes,
+                                    partition_map.begin<MapType>(),
+                                    sorted_partitions.data(),
+                                    row_indices.data(),
+                                    gather_map.data(),
+                                    num_rows,
+                                    0,
+                                    end_bit,
+                                    stream.value());
 
-    // For each `partition_map[i]`, atomically increment the corresponding
-    // partition offset to determine `i`s location in the output
-    thrust::transform(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                      partition_map.begin<MapType>(),
-                      partition_map.end<MapType>(),
-                      scatter_map.begin(),
-                      [offsets = histogram.data()] __device__(auto partition_number) {
-                        return atomicAdd(&offsets[partition_number], 1);
-                      });
+    // Gather the rows into their partitions
+    auto partitioned = detail::gather(t,
+                                      gather_map,
+                                      out_of_bounds_policy::DONT_CHECK,
+                                      negative_index_policy::NOT_ALLOWED,
+                                      stream,
+                                      mr);
 
-    // Scatter the rows into their partitions
-    auto scattered = detail::scatter(t, scatter_map, t, stream, mr);
-
-    return std::pair{std::move(scattered), std::move(partition_offsets)};
+    return std::pair{std::move(partitioned), std::move(partition_offsets)};
   }
 
   template <typename MapType, typename... Args>

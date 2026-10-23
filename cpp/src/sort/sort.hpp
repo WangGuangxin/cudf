@@ -6,6 +6,7 @@
 
 #include <cudf/column/column_view.hpp>
 #include <cudf/sorting.hpp>
+#include <cudf/table/table_view.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
 #include <rmm/cuda_stream_view.hpp>
@@ -38,6 +39,20 @@ std::unique_ptr<column> sorted_order(column_view const& input,
                                      null_order null_precedence,
                                      rmm::cuda_stream_view stream,
                                      rmm::device_async_resource_ref mr);
+
+/**
+ * @brief Multi-column sorted order by least-significant-key-first radix sort passes.
+ *
+ * Applies to integral, decimal, boolean and chrono keys and to strings with few distinct values.
+ *
+ * @return The sorted order, or nullptr when the keys are not supported and the caller must use
+ * the comparison sort
+ */
+std::unique_ptr<column> sorted_order_lsd(table_view const& input,
+                                         std::vector<order> const& column_order,
+                                         std::vector<null_order> const& null_precedence,
+                                         rmm::cuda_stream_view stream,
+                                         rmm::device_async_resource_ref mr);
 
 }  // namespace detail
 }  // namespace cudf

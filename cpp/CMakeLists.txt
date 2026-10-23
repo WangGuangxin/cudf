@@ -995,6 +995,7 @@ add_library(
   src/sort/sort.cu
   src/sort/sort_column.cu
   src/sort/sort_radix.cu
+  src/sort/sorted_order_lsd.cu
   src/sort/sorted_order_radix.cu
   src/sort/stable_segmented_sort.cu
   src/sort/stable_sort_column.cu

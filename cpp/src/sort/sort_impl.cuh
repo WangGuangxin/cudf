@@ -58,6 +58,12 @@ std::unique_ptr<column> sorted_order(table_view input,
     return sorted_order<method>(single_col, col_order, null_prec, stream, mr);
   }
 
+  if (not cudf::detail::has_nested_columns(input)) {
+    if (auto lsd = sorted_order_lsd(input, column_order, null_precedence, stream, mr)) {
+      return lsd;
+    }
+  }
+
   std::unique_ptr<column> sorted_indices = cudf::make_numeric_column(
     data_type(type_to_id<size_type>()), input.num_rows(), mask_state::UNALLOCATED, stream, mr);
   mutable_column_view mutable_indices_view = sorted_indices->mutable_view();

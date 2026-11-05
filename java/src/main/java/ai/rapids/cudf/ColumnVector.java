@@ -1007,9 +1007,12 @@ public final class ColumnVector extends ColumnView {
     public OffHeapState(long viewHandle, DeviceMemoryBuffer contiguousBuffer) {
       assert viewHandle != 0;
       this.viewHandle = viewHandle;
-      // The contiguous allocation owns all of the data. Borrowed buffer views own
-      // nothing and need not be created just to close them. In particular, finding
-      // a string data view's length would synchronize to read its last offset.
+      BaseDeviceMemoryBuffer valid = getValid();
+      BaseDeviceMemoryBuffer data = getData();
+      BaseDeviceMemoryBuffer offsets = getOffsets();
+      toClose.add(data);
+      toClose.add(valid);
+      toClose.add(offsets);
       contiguousBuffer.incRefCount();
       toClose.add(contiguousBuffer);
     }

@@ -33,8 +33,8 @@
 #include <cuda/std/bit>
 #include <thrust/for_each.h>
 #include <thrust/scan.h>
-#include <thrust/sequence.h>
 #include <thrust/scatter.h>
+#include <thrust/sequence.h>
 #include <thrust/transform.h>
 
 #include <stdexcept>
@@ -770,6 +770,45 @@ std::pair<std::unique_ptr<table>, std::vector<size_type>> hash_partition_table(
   }
 }
 
+// Build the `cudf::partition` gather map with atomics rather than a radix sort when the sort would
+// need more than one 8-bit pass and rows are spread over at least
+// 2^ATOMIC_MIN_EFFECTIVE_PARTITIONS_LOG2 "effective" partitions (num_rows^2 / sum of squared
+// partition sizes, i.e. the inverse chance two random rows share a partition). Atomic contention
+// falls roughly as 1 / effective partitions, and past this point claiming slots atomically is
+// cheaper than two or more radix passes.
+constexpr int ATOMIC_MIN_EFFECTIVE_PARTITIONS_LOG2 = 12;  // 4096
+constexpr int SINGLE_RADIX_PASS_BITS               = 8;
+
+constexpr size_type GATHER_MAP_BLOCK_SIZE = 256;
+
+/**
+ * @brief Writes each row index to an atomically claimed slot of its partition, building a gather
+ * map. When a whole warp maps to one partition (common for clustered or sorted maps), one lane
+ * claims the slots for the warp so contiguous rows do not serialize on a single counter.
+ */
+template <typename MapType>
+CUDF_KERNEL void __launch_bounds__(GATHER_MAP_BLOCK_SIZE)
+  atomic_partition_gather_map(MapType const* __restrict__ partition_map,
+                              size_type num_rows,
+                              size_type* __restrict__ offsets,
+                              size_type* __restrict__ gather_map)
+{
+  auto const row = cudf::detail::grid_1d::global_thread_id();
+  if (row >= num_rows) { return; }
+  auto const partition = static_cast<size_type>(partition_map[row]);
+  auto const active    = __activemask();
+  auto const leader    = __ffs(active) - 1;
+  auto const lane      = static_cast<int>(threadIdx.x % cudf::detail::warp_size);
+  if (__all_sync(active, partition == __shfl_sync(active, partition, leader))) {
+    size_type base{};
+    if (lane == leader) { base = atomicAdd(&offsets[partition], __popc(active)); }
+    base                                                    = __shfl_sync(active, base, leader);
+    gather_map[base + __popc(active & ((1u << lane) - 1u))] = static_cast<size_type>(row);
+  } else {
+    gather_map[atomicAdd(&offsets[partition], 1)] = static_cast<size_type>(row);
+  }
+}
+
 struct dispatch_map_type {
   /**
    * @brief Partitions the table `t` according to the `partition_map`.
@@ -778,17 +817,13 @@ struct dispatch_map_type {
    * - Compute the histogram of the size each partition
    * - Compute the exclusive scan of the histogram to get the offset for each
    * partition in the final partitioned output
-   * - Use a transform iterator to materialize the scatter map of the rows from
-   * `t` into the final output.
+   * - Build a gather map listing the rows of each partition in turn, either by
+   * radix sorting row indices on the partition number (when rows concentrate in
+   * few partitions or one 8-bit pass suffices) or by atomically claiming output
+   * slots (when rows spread over many partitions, so contention is low)
+   * - Gather `t` with that map into the final output
    *
-   * @note JH: It would likely be more efficient to avoid the atomic increments
-   * in the transform iterator. It would probably be faster to compute a
-   * per-thread block histogram and compute an exclusive scan of all of the
-   * per-block histograms (like in hash partition). But I'm purposefully trying
-   * to reduce memory pressure by avoiding intermediate materializations. Plus,
-   * atomics resolve in L2 and should be pretty fast since all the offsets will
-   * fit in L2.
-   *
+   * Row order within a partition is stable on the radix sort path only.
    */
   template <typename MapType>
   std::pair<std::unique_ptr<table>, std::vector<size_type>> operator()(
@@ -837,44 +872,67 @@ struct dispatch_map_type {
     // Copy partition offsets to host
     auto const partition_offsets = cudf::detail::make_std_vector(histogram, stream);
 
-    // Order row indices by partition number with a radix sort on just the bits that can be set
-    // in a partition number. This replaces per-row atomic increments of the partition offsets,
-    // which serialize heavily when many rows share few partitions, and yields a stable order.
-    // The sorted row indices form a gather map, which avoids `detail::scatter(t, map, t)` first
-    // copying all of `t` into the output only for every row to be overwritten.
     auto const num_rows = partition_map.size();
-    rmm::device_uvector<size_type> row_indices(num_rows, stream);
-    thrust::sequence(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
-                     row_indices.begin(),
-                     row_indices.end());
-    rmm::device_uvector<MapType> sorted_partitions(num_rows, stream);
     rmm::device_uvector<size_type> gather_map(num_rows, stream);
     // Partition numbers are in [0, num_partitions), so only the low bits need sorting
     int const end_bit =
       std::max(1, static_cast<int>(cuda::std::bit_width(static_cast<uint32_t>(num_partitions))));
-    std::size_t sort_temp_bytes{};
-    cub::DeviceRadixSort::SortPairs(nullptr,
-                                    sort_temp_bytes,
-                                    partition_map.begin<MapType>(),
-                                    sorted_partitions.data(),
-                                    row_indices.data(),
-                                    gather_map.data(),
-                                    num_rows,
-                                    0,
-                                    end_bit,
-                                    stream.value());
-    rmm::device_buffer sort_temp(sort_temp_bytes, stream);
-    cub::DeviceRadixSort::SortPairs(sort_temp.data(),
-                                    sort_temp_bytes,
-                                    partition_map.begin<MapType>(),
-                                    sorted_partitions.data(),
-                                    row_indices.data(),
-                                    gather_map.data(),
-                                    num_rows,
-                                    0,
-                                    end_bit,
-                                    stream.value());
+    bool use_atomics = false;
+    if (end_bit > SINGLE_RADIX_PASS_BITS) {
+      // sum of squared sizes <= num_rows^2 < 2^62, so this cannot overflow
+      uint64_t sum_sq_sizes = 0;
+      for (std::size_t i = 0; i + 1 < partition_offsets.size(); ++i) {
+        auto const size = static_cast<uint64_t>(partition_offsets[i + 1] - partition_offsets[i]);
+        sum_sq_sizes += size * size;
+      }
+      auto const rows = static_cast<uint64_t>(num_rows);
+      use_atomics =
+        ((rows * rows) >> ATOMIC_MIN_EFFECTIVE_PARTITIONS_LOG2) >= sum_sq_sizes && num_rows > 0;
+    }
 
+    if (use_atomics) {
+      // Rows are spread over many partitions, so atomically claiming output slots rarely contends
+      // and is cheaper than a multi-pass radix sort. `histogram` holds the partition offsets.
+      auto const grid = util::div_rounding_up_safe(num_rows, GATHER_MAP_BLOCK_SIZE);
+      atomic_partition_gather_map<MapType><<<grid, GATHER_MAP_BLOCK_SIZE, 0, stream.value()>>>(
+        partition_map.data<MapType>(), num_rows, histogram.data(), gather_map.data());
+      CUDF_CUDA_TRY(cudaGetLastError());
+    } else {
+      // Order row indices by partition number with a radix sort on just the bits that can be set
+      // in a partition number. This avoids per-row atomic increments of the partition offsets,
+      // which serialize heavily when many rows share few partitions, and yields a stable order.
+      rmm::device_uvector<size_type> row_indices(num_rows, stream);
+      thrust::sequence(rmm::exec_policy_nosync(stream, cudf::get_current_device_resource_ref()),
+                       row_indices.begin(),
+                       row_indices.end());
+      rmm::device_uvector<MapType> sorted_partitions(num_rows, stream);
+      std::size_t sort_temp_bytes{};
+      cub::DeviceRadixSort::SortPairs(nullptr,
+                                      sort_temp_bytes,
+                                      partition_map.begin<MapType>(),
+                                      sorted_partitions.data(),
+                                      row_indices.data(),
+                                      gather_map.data(),
+                                      num_rows,
+                                      0,
+                                      end_bit,
+                                      stream.value());
+      rmm::device_buffer sort_temp(sort_temp_bytes, stream);
+      cub::DeviceRadixSort::SortPairs(sort_temp.data(),
+                                      sort_temp_bytes,
+                                      partition_map.begin<MapType>(),
+                                      sorted_partitions.data(),
+                                      row_indices.data(),
+                                      gather_map.data(),
+                                      num_rows,
+                                      0,
+                                      end_bit,
+                                      stream.value());
+    }
+
+    // The sorted or atomically placed row indices form a gather map, which avoids
+    // `detail::scatter(t, map, t)` first copying all of `t` into the output only for every row to
+    // be overwritten.
     // Gather the rows into their partitions
     auto partitioned = detail::gather(t,
                                       gather_map,

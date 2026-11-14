@@ -255,6 +255,10 @@ ConfigureNVBench(
 ConfigureNVBench(HASHING_NVBENCH hashing/hash.cpp hashing/partition.cpp)
 
 # ##################################################################################################
+# * partitioning benchmark ------------------------------------------------------------------------
+ConfigureNVBench(PARTITION_NVBENCH partitioning/partition.cpp)
+
+# ##################################################################################################
 # * hybrid scan filters benchmark
 # ----------------------------------------------------------------------
 ConfigureNVBench(

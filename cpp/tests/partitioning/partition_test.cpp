@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2020-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2020-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #include <cudf_test/base_fixture.hpp>
@@ -15,6 +15,7 @@
 #include <cudf/table/table.hpp>
 
 #include <cuda/std/tuple>
+#include <thrust/iterator/counting_iterator.h>
 #include <thrust/iterator/zip_iterator.h>
 
 #include <algorithm>
@@ -341,4 +342,80 @@ TEST_F(PartitionTestNotTyped, NoIntegerOverflow)
   auto expected_table = cudf::table_view{{expected}};
 
   run_partition_test(table_to_partition, map, 2, expected_table, expected_offsets);
+}
+
+namespace {
+// Partitions row ids by `map` and checks every row lands exactly once, in the partition its map
+// value names, with offsets equal to the partition boundaries.
+void check_partitioned_row_ids(std::vector<int32_t> const& h_map, cudf::size_type num_partitions)
+{
+  auto const num_rows = static_cast<cudf::size_type>(h_map.size());
+  auto const ids_iter = thrust::counting_iterator<int32_t>(0);
+  fixed_width_column_wrapper<int32_t> ids(ids_iter, ids_iter + num_rows);
+  fixed_width_column_wrapper<int32_t> map(h_map.begin(), h_map.end());
+
+  auto const [result, offsets] = cudf::partition(cudf::table_view{{ids, map}}, map, num_partitions);
+
+  ASSERT_EQ(offsets.size(), static_cast<std::size_t>(num_partitions) + 1);
+  EXPECT_EQ(offsets.front(), 0);
+  EXPECT_EQ(offsets.back(), num_rows);
+  auto const out_ids = cudf::test::to_host<int32_t>(result->get_column(0)).first;
+  auto const out_map = cudf::test::to_host<int32_t>(result->get_column(1)).first;
+  std::vector<bool> seen(num_rows, false);
+  for (cudf::size_type p = 0; p < num_partitions; ++p) {
+    for (auto i = offsets[p]; i < offsets[p + 1]; ++i) {
+      ASSERT_EQ(out_map[i], p);
+      ASSERT_EQ(h_map[out_ids[i]], p);
+      ASSERT_FALSE(seen[out_ids[i]]);
+      seen[out_ids[i]] = true;
+    }
+  }
+}
+}  // namespace
+
+// Many partitions with rows spread evenly: the gather map is built with atomics
+TEST_F(PartitionTestNotTyped, ManyPartitionsSpread)
+{
+  cudf::size_type const num_rows = 1 << 20;
+  cudf::size_type const parts    = 1 << 13;
+  std::vector<int32_t> h_map(num_rows);
+  for (cudf::size_type i = 0; i < num_rows; ++i) {
+    h_map[i] = static_cast<int32_t>((static_cast<uint64_t>(i) * 2654435761u) % parts);
+  }
+  check_partitioned_row_ids(h_map, parts);
+}
+
+// Many partitions holding runs of consecutive rows: exercises whole-warp slot claims on the atomic
+// path, including runs that start and end mid-warp
+TEST_F(PartitionTestNotTyped, ManyPartitionsClustered)
+{
+  cudf::size_type const num_rows = (1 << 20) + 13;
+  cudf::size_type const parts    = 1 << 14;
+  std::vector<int32_t> h_map(num_rows);
+  for (cudf::size_type i = 0; i < num_rows; ++i) {
+    h_map[i] = (i / 40) % parts;
+  }
+  check_partitioned_row_ids(h_map, parts);
+}
+
+// Many partitions but most rows in one: the gather map is built with a multi-pass radix sort,
+// which keeps rows of a partition in input order
+TEST_F(PartitionTestNotTyped, ManyPartitionsConcentratedIsStable)
+{
+  cudf::size_type const num_rows = 1 << 18;
+  cudf::size_type const parts    = 1 << 12;
+  std::vector<int32_t> h_map(num_rows);
+  for (cudf::size_type i = 0; i < num_rows; ++i) {
+    h_map[i] = i % 4 == 0 ? (i / 4) % parts : 7;
+  }
+  check_partitioned_row_ids(h_map, parts);
+
+  auto const ids_iter = thrust::counting_iterator<int32_t>(0);
+  fixed_width_column_wrapper<int32_t> ids(ids_iter, ids_iter + num_rows);
+  fixed_width_column_wrapper<int32_t> map(h_map.begin(), h_map.end());
+  auto const [result, offsets] = cudf::partition(cudf::table_view{{ids}}, map, parts);
+  auto const out_ids           = cudf::test::to_host<int32_t>(result->get_column(0)).first;
+  for (cudf::size_type p = 0; p < parts; ++p) {
+    EXPECT_TRUE(std::is_sorted(out_ids.begin() + offsets[p], out_ids.begin() + offsets[p + 1]));
+  }
 }

@@ -42,6 +42,19 @@ struct decompression_info {
 [[nodiscard]] size_t get_decompression_scratch_size(decompression_info const& di);
 
 /**
+ * @brief Computes the scratch space required for each element of `infos`.
+ *
+ * Equivalent to calling `get_decompression_scratch_size` on every element, but the engine
+ * selection (environment policies, nvCOMP availability) is resolved once per compression type
+ * instead of once per element. Use this for per-page computations.
+ *
+ * @param infos Decompression info for each element
+ * @param sizes Output scratch size for each element; must have the same size as `infos`
+ */
+void get_decompression_scratch_sizes(host_span<decompression_info const> infos,
+                                     host_span<size_t> sizes);
+
+/**
  * @brief Returns total scratch space required based on the compressed input data.
  *
  * Might launch a kernel. Should be used only if is_decompression_scratch_size_ex_supported returns

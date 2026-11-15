@@ -30,6 +30,8 @@
 #include <cuda/stream>
 #include <thrust/fill.h>
 
+#include <algorithm>
+#include <memory>
 #include <optional>
 
 namespace cudf {
@@ -256,6 +258,200 @@ std::unique_ptr<rmm::device_uvector<size_type>> mixed_left_anti_join(
                                  join_kind::LEFT_ANTI_JOIN,
                                  stream,
                                  mr);
+}
+
+
+struct mixed_semi_join_hash_table::impl {
+  table_view right_equality;
+  table_view right_conditional;
+  null_equality compare_nulls;
+  std::shared_ptr<cudf::detail::row::equality::preprocessed_table> preprocessed_right;
+  std::shared_ptr<cudf::detail::row::equality::preprocessed_table> preprocessed_right_conditional;
+  std::unique_ptr<detail::hash_set_type> row_set;
+
+  impl(table_view const& right_eq,
+       table_view const& right_cond,
+       null_equality nulls,
+       cuda::stream_ref stream,
+       rmm::device_async_resource_ref mr)
+    : right_equality{right_eq}, right_conditional{right_cond}, compare_nulls{nulls}
+  {
+    CUDF_EXPECTS(right_conditional.num_rows() == right_equality.num_rows(),
+                 "The right conditional and equality tables must have the same number of rows.");
+    auto const temp_mr = cudf::get_current_device_resource_ref();
+    // Same construction as detail::mixed_join_semi (see the comments there).
+    preprocessed_right =
+      cudf::detail::row::equality::preprocessed_table::create(right_equality, stream, temp_mr);
+    auto const right_nulls    = cudf::nullate::DYNAMIC{cudf::has_nulls(right_equality)};
+    auto const row_hash_right = cudf::detail::row::hash::row_hasher{preprocessed_right};
+    auto const row_comparator_right =
+      cudf::detail::row::equality::two_table_comparator{preprocessed_right, preprocessed_right};
+    auto const equality_right_equality =
+      row_comparator_right.equal_to<false>(right_nulls, compare_nulls);
+    preprocessed_right_conditional =
+      cudf::detail::row::equality::preprocessed_table::create(right_conditional, stream, temp_mr);
+    auto const row_comparator_conditional_right =
+      cudf::detail::row::equality::two_table_comparator{preprocessed_right_conditional,
+                                                        preprocessed_right_conditional};
+    auto const right_conditional_nulls =
+      cudf::nullate::DYNAMIC{cudf::has_nulls(right_conditional)};
+    auto const equality_right_conditional = row_comparator_conditional_right.equal_to<false>(
+      right_conditional_nulls, null_equality::EQUAL);
+
+    auto const right_num_rows = right_equality.num_rows();
+    // Braced construction exactly as in detail::mixed_join_semi (probing scheme from the hasher).
+    row_set = std::unique_ptr<detail::hash_set_type>(new detail::hash_set_type{
+      {static_cast<std::size_t>(std::max(right_num_rows, 1))},
+      cudf::detail::CUCO_DESIRED_LOAD_FACTOR,
+      cuco::empty_key{JoinNoMatch},
+      {equality_right_equality, equality_right_conditional},
+      {row_hash_right.device_hasher(right_nulls)},
+      {},
+      {},
+      rmm::mr::polymorphic_allocator<char>{mr},
+      {stream.get()}});
+
+    if (right_num_rows == 0) { return; }
+    auto iter = cuda::counting_iterator<cudf::size_type>{0};
+    if ((compare_nulls == null_equality::EQUAL) or (not nullable(right_equality))) {
+      row_set->insert_async(iter, iter + right_num_rows, stream.get());
+    } else {
+      cuda::counting_iterator<cudf::size_type> stencil(0);
+      auto const [row_bitmask, _] = cudf::detail::bitmask_and(right_equality, stream, temp_mr);
+      detail::row_is_valid pred{static_cast<bitmask_type const*>(row_bitmask.data())};
+      row_set->insert_if_async(iter, iter + right_num_rows, stencil, pred, stream.get());
+      // row_bitmask is freed at the end of this scope: finish the insert first.
+      stream.sync();
+    }
+  }
+
+  std::unique_ptr<rmm::device_uvector<size_type>> probe(table_view const& left_equality,
+                                                        table_view const& left_conditional,
+                                                        ast::expression const& binary_predicate,
+                                                        join_kind join_type,
+                                                        cuda::stream_ref stream,
+                                                        rmm::device_async_resource_ref mr) const
+  {
+    CUDF_EXPECTS(left_conditional.num_rows() == left_equality.num_rows(),
+                 "The left conditional and equality tables must have the same number of rows.");
+    CUDF_EXPECTS(left_equality.num_columns() == right_equality.num_columns(),
+                 "Mismatch in number of equality columns.");
+    auto const right_num_rows = right_conditional.num_rows();
+    auto const left_num_rows  = left_conditional.num_rows();
+    if (right_num_rows == 0) {
+      if (join_type == join_kind::LEFT_ANTI_JOIN) {
+        return detail::get_trivial_left_join_indices(left_conditional, 0, stream, mr).first;
+      }
+      return std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr);
+    }
+    if (left_num_rows == 0) {
+      return std::make_unique<rmm::device_uvector<size_type>>(0, stream, mr);
+    }
+
+    auto const has_nulls = cudf::nullate::DYNAMIC{
+      cudf::has_nulls(left_equality) or cudf::has_nulls(right_equality) or
+      binary_predicate.may_evaluate_null(left_conditional, right_conditional, stream)};
+
+    auto const parser = ast::detail::expression_parser{
+      binary_predicate, left_conditional, right_conditional, has_nulls, stream, mr};
+    CUDF_EXPECTS(parser.output_type().id() == type_id::BOOL8,
+                 "The expression must produce a boolean output.");
+
+    auto const temp_mr          = cudf::get_current_device_resource_ref();
+    auto left_view              = table_device_view::create(left_equality, stream, temp_mr);
+    auto right_view             = table_device_view::create(right_equality, stream, temp_mr);
+    auto left_conditional_view  = table_device_view::create(left_conditional, stream, temp_mr);
+    auto right_conditional_view = table_device_view::create(right_conditional, stream, temp_mr);
+
+    auto const preprocessed_left =
+      cudf::detail::row::equality::preprocessed_table::create(left_equality, stream, temp_mr);
+    auto const row_comparator =
+      cudf::detail::row::equality::two_table_comparator{preprocessed_left, preprocessed_right};
+    auto const equality_left = row_comparator.equal_to<false>(has_nulls, compare_nulls);
+
+    detail::grid_1d const config(left_num_rows * detail::hash_set_type::cg_size,
+                                 detail::DEFAULT_JOIN_BLOCK_SIZE);
+    auto const shmem_size_per_block =
+      parser.shmem_per_thread *
+      cuco::detail::int_div_ceil(config.num_threads_per_block, detail::hash_set_type::cg_size);
+
+    auto const row_hash  = cudf::detail::row::hash::row_hasher{preprocessed_left};
+    auto const hash_left = row_hash.device_hasher(has_nulls);
+    detail::hash_set_ref_type const row_set_ref =
+      row_set->ref(cuco::contains).rebind_hash_function(hash_left);
+
+    auto left_table_keep_mask = rmm::device_uvector<bool>(left_num_rows, stream, temp_mr);
+    detail::launch_mixed_join_semi(has_nulls,
+                                   *left_conditional_view,
+                                   *right_conditional_view,
+                                   *left_view,
+                                   *right_view,
+                                   equality_left,
+                                   row_set_ref,
+                                   cudf::device_span<bool>(left_table_keep_mask),
+                                   parser.device_expression_data,
+                                   config,
+                                   shmem_size_per_block,
+                                   stream);
+
+    auto gather_map =
+      std::make_unique<rmm::device_uvector<size_type>>(left_num_rows, stream, mr);
+    auto gather_map_end = cudf::detail::copy_if(
+      cuda::counting_iterator<size_type>{0},
+      cuda::counting_iterator<size_type>{left_num_rows},
+      left_table_keep_mask.begin(),
+      gather_map->begin(),
+      [join_type] __device__(bool keep_row) -> bool {
+        return keep_row == (join_type == join_kind::LEFT_SEMI_JOIN);
+      },
+      stream);
+    gather_map->resize(cuda::std::distance(gather_map->begin(), gather_map_end), stream);
+    return gather_map;
+  }
+};
+
+mixed_semi_join_hash_table::mixed_semi_join_hash_table(table_view const& right_equality,
+                                                       table_view const& right_conditional,
+                                                       null_equality compare_nulls,
+                                                       cuda::stream_ref stream,
+                                                       rmm::device_async_resource_ref mr)
+{
+  CUDF_FUNC_RANGE();
+  _impl = std::make_unique<impl>(right_equality, right_conditional, compare_nulls, stream, mr);
+}
+
+mixed_semi_join_hash_table::~mixed_semi_join_hash_table() = default;
+
+std::unique_ptr<rmm::device_uvector<size_type>> mixed_semi_join_hash_table::semi_join(
+  table_view const& left_equality,
+  table_view const& left_conditional,
+  ast::expression const& binary_predicate,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr) const
+{
+  CUDF_FUNC_RANGE();
+  return _impl->probe(left_equality,
+                      left_conditional,
+                      binary_predicate,
+                      join_kind::LEFT_SEMI_JOIN,
+                      stream,
+                      mr);
+}
+
+std::unique_ptr<rmm::device_uvector<size_type>> mixed_semi_join_hash_table::anti_join(
+  table_view const& left_equality,
+  table_view const& left_conditional,
+  ast::expression const& binary_predicate,
+  cuda::stream_ref stream,
+  rmm::device_async_resource_ref mr) const
+{
+  CUDF_FUNC_RANGE();
+  return _impl->probe(left_equality,
+                      left_conditional,
+                      binary_predicate,
+                      join_kind::LEFT_ANTI_JOIN,
+                      stream,
+                      mr);
 }
 
 }  // namespace cudf

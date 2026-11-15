@@ -17,6 +17,7 @@
 
 #include <cuda/stream>
 
+#include <memory>
 #include <optional>
 #include <utility>
 
@@ -316,6 +317,67 @@ std::unique_ptr<rmm::device_uvector<size_type>> mixed_left_anti_join(
   null_equality compare_nulls       = null_equality::EQUAL,
   cuda::stream_ref stream           = cudf::get_default_stream(),
   rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+
+
+/**
+ * @brief Hash table over the right (build) side of a mixed semi/anti join that can be probed
+ * repeatedly with different left (probe) tables.
+ *
+ * `mixed_left_semi_join` / `mixed_left_anti_join` rebuild this hash table on every call. When the
+ * same build side is joined against many probe batches, constructing it once and probing it with
+ * `semi_join` / `anti_join` avoids the repeated build. The results are identical to the one-shot
+ * functions.
+ *
+ * The right tables are not copied: the caller must keep their device memory alive and unchanged
+ * for the lifetime of this object.
+ */
+class mixed_semi_join_hash_table {
+ public:
+  /**
+   * @brief Build the hash table.
+   *
+   * @param right_equality The right table used for the equality join
+   * @param right_conditional The right table used for the conditional join
+   * @param compare_nulls Whether or not null values join to each other or not
+   * @param stream CUDA stream used for device memory operations and kernel launches
+   * @param mr Device memory resource used to allocate the hash table
+   */
+  mixed_semi_join_hash_table(table_view const& right_equality,
+                             table_view const& right_conditional,
+                             null_equality compare_nulls       = null_equality::EQUAL,
+                             cuda::stream_ref stream           = cudf::get_default_stream(),
+                             rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref());
+  ~mixed_semi_join_hash_table();
+  mixed_semi_join_hash_table(mixed_semi_join_hash_table const&)            = delete;
+  mixed_semi_join_hash_table& operator=(mixed_semi_join_hash_table const&) = delete;
+
+  /**
+   * @brief Same result as `mixed_left_semi_join(left_equality, right_equality, left_conditional,
+   * right_conditional, binary_predicate, compare_nulls)` with the right tables of this object.
+   */
+  [[nodiscard]] std::unique_ptr<rmm::device_uvector<size_type>> semi_join(
+    table_view const& left_equality,
+    table_view const& left_conditional,
+    ast::expression const& binary_predicate,
+    cuda::stream_ref stream           = cudf::get_default_stream(),
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref()) const;
+
+  /**
+   * @brief Same result as `mixed_left_anti_join(left_equality, right_equality, left_conditional,
+   * right_conditional, binary_predicate, compare_nulls)` with the right tables of this object.
+   */
+  [[nodiscard]] std::unique_ptr<rmm::device_uvector<size_type>> anti_join(
+    table_view const& left_equality,
+    table_view const& left_conditional,
+    ast::expression const& binary_predicate,
+    cuda::stream_ref stream           = cudf::get_default_stream(),
+    rmm::device_async_resource_ref mr = cudf::get_current_device_resource_ref()) const;
+
+  struct impl;
+
+ private:
+  std::unique_ptr<impl> _impl;
+};
 
 /**
  * @brief Returns the exact number of matches (rows) when performing a

@@ -5021,4 +5021,63 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_Table_sample(
   }
   JNI_CATCH(env, 0);
 }
+
+JNIEXPORT jlong JNICALL Java_ai_rapids_cudf_MixedSemiJoinHashTable_create(
+  JNIEnv* env, jclass, jlong j_right_keys, jlong j_right_condition, jboolean j_nulls_equal)
+{
+  JNI_NULL_CHECK(env, j_right_keys, "right keys table is null", 0);
+  JNI_NULL_CHECK(env, j_right_condition, "right condition table is null", 0);
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto const right_keys      = reinterpret_cast<cudf::table_view const*>(j_right_keys);
+    auto const right_condition = reinterpret_cast<cudf::table_view const*>(j_right_condition);
+    auto const nulls_equal =
+      j_nulls_equal ? cudf::null_equality::EQUAL : cudf::null_equality::UNEQUAL;
+    return ptr_as_jlong(
+      new cudf::mixed_semi_join_hash_table(*right_keys, *right_condition, nulls_equal));
+  }
+  JNI_CATCH(env, 0);
+}
+
+JNIEXPORT jlongArray JNICALL
+Java_ai_rapids_cudf_MixedSemiJoinHashTable_probe(JNIEnv* env,
+                                                 jclass,
+                                                 jlong j_handle,
+                                                 jlong j_left_keys,
+                                                 jlong j_left_condition,
+                                                 jlong j_condition,
+                                                 jboolean j_semi)
+{
+  JNI_NULL_CHECK(env, j_handle, "hash table is null", NULL);
+  JNI_NULL_CHECK(env, j_left_keys, "left keys table is null", NULL);
+  JNI_NULL_CHECK(env, j_left_condition, "left condition table is null", NULL);
+  JNI_NULL_CHECK(env, j_condition, "condition is null", NULL);
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    auto const table     = reinterpret_cast<cudf::mixed_semi_join_hash_table const*>(j_handle);
+    auto const left_keys = reinterpret_cast<cudf::table_view const*>(j_left_keys);
+    auto const left_condition = reinterpret_cast<cudf::table_view const*>(j_left_condition);
+    auto const condition = reinterpret_cast<cudf::jni::ast::compiled_expr const*>(j_condition);
+    auto map             = j_semi ? table->semi_join(*left_keys, *left_condition,
+                                                     condition->get_top_expression())
+                                  : table->anti_join(*left_keys, *left_condition,
+                                                     condition->get_top_expression());
+    return cudf::jni::gather_map_to_java(env, std::move(map));
+  }
+  JNI_CATCH(env, NULL);
+}
+
+JNIEXPORT void JNICALL Java_ai_rapids_cudf_MixedSemiJoinHashTable_destroy(JNIEnv* env,
+                                                                          jclass,
+                                                                          jlong j_handle)
+{
+  JNI_TRY
+  {
+    cudf::jni::auto_set_device(env);
+    delete reinterpret_cast<cudf::mixed_semi_join_hash_table*>(j_handle);
+  }
+  JNI_CATCH(env, );
+}
 }  // extern "C"

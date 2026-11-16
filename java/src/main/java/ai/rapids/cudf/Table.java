@@ -304,13 +304,17 @@ public final class Table implements AutoCloseable {
    * @param filePath           the path of the file to read, or null if no path should be read.
    * @param addrsAndSizes      the address and size pairs for every buffer or null for no buffers.
    * @param timeUnit           return type of TimeStamp in units
+   * @param serializeColumnChunkReads whether to serialize column chunk reads until completion
    */
   private static native long[] readParquet(String[] filterColumnNames, boolean[] binaryToString, String filePath,
-                                           long[] addrsAndSizes, int timeUnit) throws CudfException;
+                                           long[] addrsAndSizes, int timeUnit,
+                                           boolean serializeColumnChunkReads) throws CudfException;
 
   private static native long[] readParquetFromDataSource(String[] filterColumnNames,
                                                          boolean[] binaryToString, int timeUnit,
-                                                         long dataSourceHandle) throws CudfException;
+                                                         long dataSourceHandle,
+                                                         boolean serializeColumnChunkReads)
+      throws CudfException;
 
   /**
    * Read in Avro formatted data.
@@ -1294,7 +1298,8 @@ public final class Table implements AutoCloseable {
    */
   public static Table readParquet(ParquetOptions opts, File path) {
     return new Table(readParquet(opts.getIncludeColumnNames(), opts.getReadBinaryAsString(),
-        path.getAbsolutePath(), null, opts.timeUnit().typeId.getNativeId()));
+        path.getAbsolutePath(), null, opts.timeUnit().typeId.getNativeId(),
+        opts.isSerializeColumnChunkReads()));
   }
 
   /**
@@ -1369,7 +1374,8 @@ public final class Table implements AutoCloseable {
     assert offset >= 0 && offset < buffer.length;
     long[] addrsSizes = new long[]{ buffer.getAddress() + offset, len };
     return new Table(readParquet(opts.getIncludeColumnNames(), opts.getReadBinaryAsString(),
-        null, addrsSizes, opts.timeUnit().typeId.getNativeId()));
+        null, addrsSizes, opts.timeUnit().typeId.getNativeId(),
+        opts.isSerializeColumnChunkReads()));
   }
 
   /**
@@ -1387,7 +1393,8 @@ public final class Table implements AutoCloseable {
       addrsSizes[(i * 2) + 1] = buffers[i].getLength();
     }
     return new Table(readParquet(opts.getIncludeColumnNames(), opts.getReadBinaryAsString(),
-        null, addrsSizes, opts.timeUnit().typeId.getNativeId()));
+        null, addrsSizes, opts.timeUnit().typeId.getNativeId(),
+        opts.isSerializeColumnChunkReads()));
   }
 
   /**
@@ -1401,7 +1408,7 @@ public final class Table implements AutoCloseable {
     try {
       return new Table(readParquetFromDataSource(opts.getIncludeColumnNames(),
               opts.getReadBinaryAsString(), opts.timeUnit().typeId.getNativeId(),
-              dataSourceHandle));
+              dataSourceHandle, opts.isSerializeColumnChunkReads()));
     } finally {
       DataSourceHelper.destroyWrapperDataSource(dataSourceHandle);
     }

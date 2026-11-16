@@ -45,8 +45,19 @@ using cudf::io::text::byte_range_info;
  * @brief Controls whether I/O submissions are serialized across callers.
  */
 enum class io_submission_policy : int8_t {
-  SERIALIZE,  ///< Serialize submissions across callers that use this policy
-  INTERLEAVE  ///< Allow submissions from different callers to interleave.
+  SERIALIZE,   ///< Serialize submissions across callers that use this policy
+  INTERLEAVE,  ///< Allow submissions from different callers to interleave.
+  /**
+   * Serialize submissions as with `SERIALIZE`, and also hold the per-device lock until this
+   * caller's device reads and host-to-device copies have completed. Under many concurrent callers,
+   * this lets transfers finish one caller at a time so earlier callers can start computing while
+   * later callers are still transferring, instead of all callers' transfers finishing together.
+   *
+   * The fetch blocks until its transfers complete, so it cannot overlap them with other work on
+   * the calling thread, and device reads from different callers (for example, GPUDirect Storage
+   * reads) no longer run concurrently.
+   */
+  SERIALIZE_COMPLETION
 };
 
 /**

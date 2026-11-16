@@ -20,10 +20,12 @@ public class ParquetOptions extends ColumnFilterOptions {
 
   private final DType unit;
   private final boolean[] readBinaryAsString;
+  private final boolean serializeColumnChunkReads;
 
   private ParquetOptions(Builder builder) {
     super(builder);
     unit = builder.unit;
+    serializeColumnChunkReads = builder.serializeColumnChunkReads;
     readBinaryAsString = new boolean[builder.binaryAsStringColumns.size()];
     for (int i = 0 ; i < builder.binaryAsStringColumns.size() ; i++) {
       readBinaryAsString[i] = builder.binaryAsStringColumns.get(i);
@@ -38,13 +40,38 @@ public class ParquetOptions extends ColumnFilterOptions {
     return readBinaryAsString;
   }
 
+  /**
+   * Whether column chunk reads are serialized until completion across concurrent readers.
+   * @see Builder#withSerializeColumnChunkReads(boolean)
+   */
+  public boolean isSerializeColumnChunkReads() {
+    return serializeColumnChunkReads;
+  }
+
   public static ParquetOptions.Builder builder() {
     return new Builder();
   }
 
   public static class Builder extends ColumnFilterOptions.Builder<Builder> {
     private DType unit = DType.EMPTY;
+    private boolean serializeColumnChunkReads = false;
     final List<Boolean> binaryAsStringColumns = new ArrayList<>();
+
+    /**
+     * Set whether column chunk reads are serialized until completion across concurrent readers.
+     * When enabled, each reader on a GPU transfers its column chunk data and waits for the
+     * transfers to complete before another reader with this option enabled starts its own. With
+     * many concurrent readers this lets earlier readers start decoding while later readers are
+     * still transferring, instead of all readers' transfers completing together. It can lower
+     * throughput for data sources that rely on concurrent device reads, such as GPUDirect
+     * Storage. Disabled by default.
+     * @param serialize whether to serialize column chunk reads until completion
+     * @return builder for chaining
+     */
+    public Builder withSerializeColumnChunkReads(boolean serialize) {
+      this.serializeColumnChunkReads = serialize;
+      return this;
+    }
 
     /**
      * Specify the time unit to use when returning timestamps.

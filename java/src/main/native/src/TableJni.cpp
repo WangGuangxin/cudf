@@ -2086,7 +2086,8 @@ Java_ai_rapids_cudf_Table_readParquetFromDataSource(JNIEnv* env,
                                                     jobjectArray filter_col_names,
                                                     jbooleanArray j_col_binary_read,
                                                     jint unit,
-                                                    jlong ds_handle)
+                                                    jlong ds_handle,
+                                                    jboolean serialize_column_chunk_reads)
 {
   JNI_NULL_CHECK(env, ds_handle, "no data source handle given", 0);
   JNI_NULL_CHECK(env, j_col_binary_read, "null col_binary_read", 0);
@@ -2111,19 +2112,22 @@ Java_ai_rapids_cudf_Table_readParquetFromDataSource(JNIEnv* env,
         .timestamp_type(cudf::data_type(static_cast<cudf::type_id>(unit)))
         // Ignore any missing projected column(s) by default
         .ignore_missing_columns(true)
+        .serialize_column_chunk_reads(static_cast<bool>(serialize_column_chunk_reads))
         .build();
     return convert_table_for_return(env, cudf::io::read_parquet(opts).tbl);
   }
   JNI_CATCH(env, NULL);
 }
 
-JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_Table_readParquet(JNIEnv* env,
-                                                                   jclass,
-                                                                   jobjectArray filter_col_names,
-                                                                   jbooleanArray j_col_binary_read,
-                                                                   jstring inputfilepath,
-                                                                   jlongArray addrs_and_sizes,
-                                                                   jint unit)
+JNIEXPORT jlongArray JNICALL
+Java_ai_rapids_cudf_Table_readParquet(JNIEnv* env,
+                                     jclass,
+                                     jobjectArray filter_col_names,
+                                     jbooleanArray j_col_binary_read,
+                                     jstring inputfilepath,
+                                     jlongArray addrs_and_sizes,
+                                     jint unit,
+                                     jboolean serialize_column_chunk_reads)
 {
   JNI_NULL_CHECK(env, j_col_binary_read, "null col_binary_read", 0);
   bool read_buffer = true;
@@ -2168,6 +2172,7 @@ JNIEXPORT jlongArray JNICALL Java_ai_rapids_cudf_Table_readParquet(JNIEnv* env,
         .timestamp_type(cudf::data_type(static_cast<cudf::type_id>(unit)))
         // Ignore any missing projected column(s) by default
         .ignore_missing_columns(true)
+        .serialize_column_chunk_reads(static_cast<bool>(serialize_column_chunk_reads))
         .build();
     auto tbl = cudf::io::read_parquet(opts).tbl;
     n_col_binary_read.cancel();

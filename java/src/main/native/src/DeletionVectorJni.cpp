@@ -46,7 +46,8 @@ cudf::io::parquet_reader_options make_parquet_reader_options(JNIEnv* env,
                                                              jbooleanArray const& col_binary_read,
                                                              jobjectArray const& row_groups,
                                                              cudf::io::source_info&& source,
-                                                             jint unit)
+                                                             jint unit,
+                                                             bool serialize_column_chunk_reads)
 {
   cudf::jni::native_jstringArray n_filter_col_names(env, filter_col_names);
   cudf::jni::native_jobjectArray<jintArray> n_row_groups(env, row_groups);
@@ -74,6 +75,7 @@ cudf::io::parquet_reader_options make_parquet_reader_options(JNIEnv* env,
     .timestamp_type(cudf::data_type(static_cast<cudf::type_id>(unit)))
     // Ignore any missing projected column(s) by default
     .ignore_missing_columns(true)
+    .serialize_column_chunk_reads(serialize_column_chunk_reads)
     .build();
 }
 
@@ -169,7 +171,8 @@ Java_ai_rapids_cudf_DeletionVector_readParquet(JNIEnv* env,
                                                jintArray deletion_vector_row_counts,
                                                jlongArray row_group_offsets,
                                                jintArray row_group_num_rows,
-                                               jboolean are_retention_vectors)
+                                               jboolean are_retention_vectors,
+                                               jboolean serialize_column_chunk_reads)
 {
   bool read_buffer = true;
   if (addrs_and_sizes == nullptr) {
@@ -201,7 +204,13 @@ Java_ai_rapids_cudf_DeletionVector_readParquet(JNIEnv* env,
                                                : cudf::io::source_info(filenames.as_cpp_vector());
 
     cudf::io::parquet_reader_options opts = make_parquet_reader_options(
-      env, filter_col_names, col_binary_read, row_groups, std::move(source), unit);
+      env,
+      filter_col_names,
+      col_binary_read,
+      row_groups,
+      std::move(source),
+      unit,
+      static_cast<bool>(serialize_column_chunk_reads));
 
     auto dv_info = make_deletion_vector_info(env,
                                              serialized_roaring64,
@@ -264,7 +273,8 @@ Java_ai_rapids_cudf_DeletionVector_createParquetChunkedReader(JNIEnv* env,
                                                               jintArray deletion_vector_row_counts,
                                                               jlongArray row_group_offsets,
                                                               jintArray row_group_num_rows,
-                                                              jboolean are_retention_vectors)
+                                                              jboolean are_retention_vectors,
+                                                              jboolean serialize_column_chunk_reads)
 {
   bool read_buffer = true;
   if (addrs_sizes == nullptr) {
@@ -296,7 +306,13 @@ Java_ai_rapids_cudf_DeletionVector_createParquetChunkedReader(JNIEnv* env,
                                                : cudf::io::source_info(filenames.as_cpp_vector());
 
     cudf::io::parquet_reader_options opts = make_parquet_reader_options(
-      env, filter_col_names, col_binary_read, row_groups, std::move(source), unit);
+      env,
+      filter_col_names,
+      col_binary_read,
+      row_groups,
+      std::move(source),
+      unit,
+      static_cast<bool>(serialize_column_chunk_reads));
 
     auto dv_info = make_deletion_vector_info(env,
                                              serialized_roaring64,

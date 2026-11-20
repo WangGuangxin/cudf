@@ -31,6 +31,9 @@
 #include <cudf/table/table_view.hpp>
 #include <cudf/transform.hpp>
 #include <cudf/unary.hpp>
+#include <cudf/utilities/error.hpp>
+
+#include <rmm/cuda_device.hpp>
 
 #include <cuda/iterator>
 #include <cuda/std/type_traits>
@@ -49,8 +52,10 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <thread>
 #include <tuple>
 #include <utility>
+#include <vector>
 
 using ParquetDecompressionTest = DecompressionTest<ParquetReaderTest>;
 
@@ -202,6 +207,58 @@ TEST_F(ParquetReaderTest, ManyTinyStringPages)
   auto const result = cudf::io::read_parquet(read_options);
 
   CUDF_TEST_EXPECT_TABLES_EQUAL(input, result.tbl->view());
+}
+
+TEST_F(ParquetReaderTest, SerializeColumnChunkReads)
+{
+  constexpr cudf::size_type num_rows = 100'000;
+  constexpr int num_threads          = 4;
+  constexpr int num_reads_per_thread = 4;
+  auto const sequence                = cuda::counting_iterator<int32_t>(0);
+  cudf::test::fixed_width_column_wrapper<int32_t> ints(sequence, sequence + num_rows);
+  auto const string_values = cudf::test::make_counting_transform_iterator(0, [](auto i) {
+    return std::to_string(i) + std::string(static_cast<std::size_t>(i % 7), 'x');
+  });
+  cudf::test::strings_column_wrapper strings(
+    string_values, string_values + num_rows, cudf::test::iterators::nulls_at({0, 11, 22}));
+  cudf::table_view const input{{ints, strings}};
+
+  std::vector<char> buffer;
+  auto const write_options =
+    cudf::io::parquet_writer_options::builder(cudf::io::sink_info{&buffer}, input)
+      .row_group_size_rows(num_rows / 4)
+      .build();
+  cudf::io::write_parquet(write_options);
+
+  auto const default_options =
+    cudf::io::parquet_reader_options::builder(
+      cudf::io::source_info{cudf::host_span<char const>{buffer.data(), buffer.size()}})
+      .build();
+  EXPECT_FALSE(default_options.is_enabled_serialize_column_chunk_reads());
+
+  auto const device = rmm::get_current_cuda_device();
+  std::vector<std::thread> threads;
+  std::vector<std::unique_ptr<cudf::table>> results(num_threads * num_reads_per_thread);
+  for (int t = 0; t < num_threads; ++t) {
+    threads.emplace_back([&, t] {
+      CUDF_CUDA_TRY(cudaSetDevice(device.value()));
+      for (int r = 0; r < num_reads_per_thread; ++r) {
+        auto const read_options =
+          cudf::io::parquet_reader_options::builder(
+            cudf::io::source_info{cudf::host_span<char const>{buffer.data(), buffer.size()}})
+            .serialize_column_chunk_reads(true)
+            .build();
+        results[t * num_reads_per_thread + r] = cudf::io::read_parquet(read_options).tbl;
+      }
+    });
+  }
+  for (auto& thread : threads) {
+    thread.join();
+  }
+
+  for (auto const& result : results) {
+    CUDF_TEST_EXPECT_TABLES_EQUAL(input, result->view());
+  }
 }
 
 TEST_F(ParquetReaderTest, PlainStringOffsetsAcrossPageGroups)

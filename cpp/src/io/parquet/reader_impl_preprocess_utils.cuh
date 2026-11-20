@@ -7,6 +7,7 @@
 
 #include "reader_impl_chunking.hpp"
 
+#include <cudf/io/parquet_io_utils.hpp>
 #include <cudf/types.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
@@ -57,6 +58,7 @@ void generate_depth_remappings(
  * @param end_chunk Index after the last column chunk to read
  * @param column_chunk_offsets File offset for all chunks
  * @param chunk_source_map Association between each column chunk and its source
+ * @param policy Whether to serialize I/O submissions or completions across readers
  * @param stream CUDA stream used for device memory operations and kernel launches
  * @param mr Device memory resource used to allocate the returned device buffers
  *
@@ -70,6 +72,7 @@ void generate_depth_remappings(
   size_t end_chunk,
   std::vector<size_t> const& column_chunk_offsets,
   std::vector<size_type> const& chunk_source_map,
+  cudf::io::parquet::io_submission_policy policy,
   cuda::stream_ref stream,
   cudf::memory_resources mr);
 

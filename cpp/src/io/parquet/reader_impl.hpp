@@ -566,6 +566,8 @@ class reader_impl {
     bool prepend_row_index_column = false;
     // Whether to try outputting DICTIONARY32 columns for fully dict-encoded string columns
     bool output_dict_columns = false;
+    // Whether to complete column chunk reads before another reader can schedule its own
+    bool serialize_column_chunk_reads = false;
   } _options;
 
   // Converts the input filter to AST output filter.

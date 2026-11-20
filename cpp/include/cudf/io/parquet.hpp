@@ -112,6 +112,8 @@ class parquet_reader_options {
   bool _use_jit_filter = false;
   // Whether to output flat string columns as DICT32 encoded columns
   bool _output_dict_columns = false;
+  // Whether to complete each reader's column chunk transfers before another reader's start
+  bool _serialize_column_chunk_reads = false;
   // Whether column name matching is case sensitive. In case of multiple
   // case-insensitive matches, the first matched column is selected
   bool _case_sensitive_names = true;
@@ -355,6 +357,24 @@ class parquet_reader_options {
    * @return `true` if the reader returns flat string columns as DICTIONARY32 encoded columns
    */
   [[nodiscard]] bool is_enabled_output_dict_columns() const { return _output_dict_columns; }
+
+  /**
+   * @brief Returns whether column chunk reads are serialized until completion across readers
+   *
+   * When true, each reader on a device schedules its column chunk device reads and host-to-device
+   * copies and waits for them to complete before another reader using this option can schedule its
+   * own. With many concurrent readers this lets transfers finish one reader at a time, so earlier
+   * readers can start decoding while later readers are still transferring. This can lower
+   * throughput for datasources that rely on concurrent device reads, such as GPUDirect Storage.
+   *
+   * When false (default), column chunk reads from different readers are allowed to interleave.
+   *
+   * @return `true` if column chunk reads are serialized until completion across readers
+   */
+  [[nodiscard]] bool is_enabled_serialize_column_chunk_reads() const
+  {
+    return _serialize_column_chunk_reads;
+  }
 
   /**
    * @brief Set a new source location
@@ -668,6 +688,15 @@ class parquet_reader_options {
    * @param val Boolean indicating whether to output DICTIONARY32 columns for flat string columns
    */
   void enable_output_dict_columns(bool val) { _output_dict_columns = val; }
+
+  /**
+   * @brief Sets whether column chunk reads are serialized until completion across readers.
+   *
+   * @see is_enabled_serialize_column_chunk_reads
+   *
+   * @param val Boolean indicating whether to serialize column chunk reads until completion
+   */
+  void enable_serialize_column_chunk_reads(bool val) { _serialize_column_chunk_reads = val; }
 };
 
 /**
@@ -987,6 +1016,20 @@ class parquet_reader_options_builder {
   parquet_reader_options_builder& output_dict_columns(bool val)
   {
     options.enable_output_dict_columns(val);
+    return *this;
+  }
+
+  /**
+   * @brief Sets whether column chunk reads are serialized until completion across readers.
+   *
+   * @see parquet_reader_options::is_enabled_serialize_column_chunk_reads
+   *
+   * @param val Boolean indicating whether to serialize column chunk reads until completion
+   * @return this for chaining
+   */
+  parquet_reader_options_builder& serialize_column_chunk_reads(bool val)
+  {
+    options.enable_serialize_column_chunk_reads(val);
     return *this;
   }
 

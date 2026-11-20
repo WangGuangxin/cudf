@@ -21,6 +21,7 @@
 #include <cudf/logger.hpp>
 #include <cudf/utilities/memory_resource.hpp>
 
+#include <rmm/cuda_device.hpp>
 #include <rmm/resource_ref.hpp>
 
 #include <cuda/buffer>
@@ -70,13 +71,13 @@ std::mutex& host_read_mutex()
 }
 
 /**
- * @brief Serializes device reads and host-to-device copies to avoid cross-thread request
- * interleaving and completion stalls
+ * @brief Serializes device reads and host-to-device copies targeting the current device to avoid
+ * cross-thread request interleaving and completion stalls
  */
 std::mutex& device_read_mutex()
 {
-  static std::mutex mutex;
-  return mutex;
+  static auto mutexes = std::vector<std::mutex>(rmm::get_num_cuda_devices());
+  return mutexes.at(rmm::get_current_cuda_device().value());
 }
 
 /**
@@ -288,7 +289,7 @@ std::tuple<std::vector<rmm::device_buffer>,
 fetch_byte_ranges_to_device_async_impl(
   std::span<std::reference_wrapper<cudf::io::datasource> const> datasources,
   std::span<std::span<cudf::io::text::byte_range_info const> const> byte_ranges_per_source,
-  bool serialize_submissions,
+  io_submission_policy policy,
   cuda::stream_ref stream,
   cudf::memory_resources mr)
 {
@@ -407,7 +408,7 @@ fetch_byte_ranges_to_device_async_impl(
   // are scheduled without interleaving with reads from other threads yielding better pipelining
   {
     std::unique_lock<std::mutex> lock(host_read_mutex(), std::defer_lock);
-    if (serialize_submissions) { lock.lock(); }
+    if (policy != io_submission_policy::INTERLEAVE) { lock.lock(); }
 
     std::for_each(iter, iter + io_offsets.size(), [&](auto const& tuple) {
       auto const src_idx   = cuda::std::get<0>(tuple);
@@ -442,11 +443,17 @@ fetch_byte_ranges_to_device_async_impl(
   // `device_read_async` is not guaranteed to follow stream-ordering (see datasource API docs)
   stream.sync();
 
-  // Schedule device reads holding the `device_read_mutex` so that all reads for a caller thread
-  // are scheduled without interleaving with reads from other threads yielding better pipelining
+  // Schedule device reads holding the per-device `device_read_mutex` so that all reads for a caller
+  // thread are scheduled without interleaving with reads from other threads.
+  //
+  // With `SERIALIZE_COMPLETION`, also hold the mutex until the reads have completed. When many
+  // threads read concurrently, their copies would otherwise be interleaved by the copy engines and
+  // all finish at about the same time, leaving the GPU idle until every caller's data has arrived.
+  // Completing each caller's reads in turn keeps the same transfer throughput for host-to-device
+  // copies but lets the earlier callers start decoding while later callers are still transferring.
   {
     std::unique_lock<std::mutex> lock(device_read_mutex(), std::defer_lock);
-    if (serialize_submissions) { lock.lock(); }
+    if (policy != io_submission_policy::INTERLEAVE) { lock.lock(); }
 
     std::for_each(iter, iter + io_offsets.size(), [&](auto const& tuple) {
       auto const src_idx   = cuda::std::get<0>(tuple);
@@ -467,10 +474,20 @@ fetch_byte_ranges_to_device_async_impl(
       CUDF_CUDA_TRY(cudf::detail::memcpy_batch_async(
         copy_dsts.data(), copy_srcs.data(), copy_sizes.data(), copy_dsts.size(), stream));
     }
+
+    if (policy == io_submission_policy::SERIALIZE_COMPLETION) {
+      for (auto& task : device_read_tasks) {
+        task.wait();
+      }
+      // Also synchronizes the copies from the host buffers before they are discarded below
+      stream.sync();
+    }
   }
 
   // Synchronize stream if `memcpy_batch_async` was called to safely discard the host buffers
-  if (not host_buffers.empty()) { stream.sync(); }
+  if (policy != io_submission_policy::SERIALIZE_COMPLETION and not host_buffers.empty()) {
+    stream.sync();
+  }
 
   auto sync_function = [](decltype(device_read_tasks) device_read_tasks) {
     cudf::detail::futures_wait_guard device_read_tasks_guard{device_read_tasks};
@@ -488,7 +505,7 @@ fetch_bloom_filters_to_device_impl(
   std::span<std::reference_wrapper<cudf::io::datasource> const> datasources,
   std::span<std::span<cudf::io::text::byte_range_info const> const>
     bloom_filter_byte_ranges_per_source,
-  bool serialize_submissions,
+  io_submission_policy policy,
   cuda::stream_ref stream,
   cudf::memory_resources mr)
 {
@@ -542,7 +559,7 @@ fetch_bloom_filters_to_device_impl(
                       initial_sizes.cbegin(),
                       total_filters,
                       initial_buffer,
-                      serialize_submissions);
+                      policy != io_submission_policy::INTERLEAVE);
 
   // Phase 2: Parse headers, organize bitset slots, and record deferred bitset reads
   std::vector<void const*> copy_srcs;
@@ -618,7 +635,7 @@ fetch_bloom_filters_to_device_impl(
                         deferred_sizes,
                         deferred_filter_indices.size(),
                         deferred_buffer,
-                        serialize_submissions);
+                        policy != io_submission_policy::INTERLEAVE);
     std::size_t deferred_dst_offset = 0;
     std::ranges::for_each(deferred_filter_indices, [&](auto const filter_idx) {
       copy_srcs[filter_idx] = deferred_buffer.data() + deferred_dst_offset;
@@ -655,11 +672,13 @@ fetch_bloom_filters_to_device_impl(
 
   // One batched copy (entries with a null source or zero size are ignored by the batch API)
   if (total_device_size != 0) {
-    {
-      std::unique_lock<std::mutex> lock(device_read_mutex(), std::defer_lock);
-      if (serialize_submissions) { lock.lock(); }
-      CUDF_CUDA_TRY(cudf::detail::memcpy_batch_async(
-        copy_dsts.data(), copy_srcs.data(), copy_sizes.data(), total_filters, stream));
+    std::unique_lock<std::mutex> lock(device_read_mutex(), std::defer_lock);
+    if (policy != io_submission_policy::INTERLEAVE) { lock.lock(); }
+    CUDF_CUDA_TRY(cudf::detail::memcpy_batch_async(
+      copy_dsts.data(), copy_srcs.data(), copy_sizes.data(), total_filters, stream));
+    // With `SERIALIZE_COMPLETION`, hold the lock until the copy has completed
+    if (policy != io_submission_policy::SERIALIZE_COMPLETION and lock.owns_lock()) {
+      lock.unlock();
     }
     stream.sync();
   }
@@ -735,7 +754,7 @@ fetch_byte_ranges_to_device_async(cudf::io::datasource& datasource,
   auto [buffers, fetched_byte_ranges, fut] = fetch_byte_ranges_to_device_async_impl(
     {datasources.data(), datasources.size()},
     {byte_ranges_per_source.data(), byte_ranges_per_source.size()},
-    policy == io_submission_policy::SERIALIZE,
+    policy,
     stream,
     mr.get_output_mr());
 
@@ -763,7 +782,7 @@ fetch_byte_ranges_to_device_async(
   return fetch_byte_ranges_to_device_async_impl(
     datasources,
     {byte_range_spans_per_source.data(), byte_range_spans_per_source.size()},
-    policy == io_submission_policy::SERIALIZE,
+    policy,
     stream,
     mr.get_output_mr());
 }
@@ -786,7 +805,7 @@ fetch_bloom_filters_to_device(
   auto [buffers, fetched_byte_ranges] = fetch_bloom_filters_to_device_impl(
     {datasources.data(), datasources.size()},
     {bloom_filter_byte_ranges_per_source.data(), bloom_filter_byte_ranges_per_source.size()},
-    policy == io_submission_policy::SERIALIZE,
+    policy,
     stream,
     mr.get_output_mr());
 
@@ -814,7 +833,7 @@ fetch_bloom_filters_to_device(
   return fetch_bloom_filters_to_device_impl(datasources,
                                             {bloom_filter_byte_range_spans_per_source.data(),
                                              bloom_filter_byte_range_spans_per_source.size()},
-                                            policy == io_submission_policy::SERIALIZE,
+                                            policy,
                                             stream,
                                             mr.get_output_mr());
 }

@@ -184,6 +184,7 @@ void generate_depth_remappings(
   size_t end_chunk,
   std::vector<size_t> const& column_chunk_offsets,
   std::vector<size_type> const& chunk_source_map,
+  cudf::io::parquet::io_submission_policy policy,
   cuda::stream_ref stream,
   cudf::memory_resources mr)
 {
@@ -209,7 +210,7 @@ void generate_depth_remappings(
   auto [buffers, data_per_source, read_task] = cudf::io::parquet::fetch_byte_ranges_to_device_async(
     {datasource_refs.data(), datasource_refs.size()},
     {source_byte_ranges.data(), source_byte_ranges.size()},
-    cudf::io::parquet::io_submission_policy::INTERLEAVE,
+    policy,
     stream,
     mr);
 
